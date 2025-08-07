@@ -1,29 +1,18 @@
-from ultralytics.trackers.bot_sort import BoTSORT
-from ultralytics.utils.plotting import colors
-import numpy as np
+# from norfair import Tracker, Detection
+# import numpy as np
 
-class FaceTracker:
-    def __init__(self):
-        self.tracker = BoTSORT(
-            reid=False,
-            track_high_thresh=0.3,
-            track_low_thresh=0.05,
-            new_track_thresh=0.7,
-            track_buffer=30
-        )
+# def euclidean_distance(detection, tracked_object):
+#     return np.linalg.norm(detection.points - tracked_object.estimate)
 
-    def update(self, faces, frame):
-        detections = []
+# class FaceTracker:
+#     def __init__(self):
+#         self.tracker = Tracker(distance_function=euclidean_distance, distance_threshold=30)
 
-        for face in faces:
-            x1, y1, x2, y2 = face.bbox.astype(int)
-            conf = 1.0  # InsightFace doesn't return confidence, assume high
-            detections.append([x1, y1, x2, y2, conf])
-
-        if not detections:
-            return []
-
-        dets = np.array(detections)
-        tracks = self.tracker.update(dets, frame)
-
-        return tracks  # Format: [x1, y1, x2, y2, id]
+#     def update(self, faces):
+#         detections = []
+#         for f in faces:
+#             x1, y1, x2, y2 = f.bbox.astype(int)
+#             x_center = (x1 + x2) / 2
+#             y_center = (y1 + y2) / 2
+#             detections.append(Detection(points=np.array([[x_center, y_center]])))
+#         return self.tracker.update(detections)
