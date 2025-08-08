@@ -2,27 +2,31 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
-from scipy.spatial.distance import cosine
+from scipy.spatial.distance import cdist
 
 # ======= CONFIG =======
-input_path = r"C:\Users\dxksh\Downloads\videoplayback.mp4"
+input_path = r"test.mp4"
 output_path = "output.mp4"
 similarity_threshold = 0.5
 embedding_buffer_size = 10
+face_detect_interval = 5  # Run InsightFace every N frames
+process_fps = 20           # Target FPS for processing
 # =======================
 
 # === Initialize Models ===
-yolo = YOLO("yolov8n.pt")  # or 'yolov8s.pt' for better accuracy
-face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(640, 640))
+yolo = YOLO("yolo11n.pt")  # smallest YOLO model
+face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
+face_app.prepare(ctx_id=0, det_size=(320, 320))  # smaller input size for speed
 
 # === Load video ===
 cap = cv2.VideoCapture(input_path)
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps    = cap.get(cv2.CAP_PROP_FPS)
+fps = cap.get(cv2.CAP_PROP_FPS)
+skip_frames = max(1, int(fps / process_fps))
+
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out    = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+out = cv2.VideoWriter(output_path, fourcc, process_fps, (width, height))
 
 # === Face ID memory ===
 face_db = {}  # {face_id: [embeddings]}
@@ -31,77 +35,84 @@ next_face_id = 0
 # === Tracker ↔ Face ID mapping ===
 track_to_face = {}  # {track_id: face_id}
 
+frame_count = 0
+cached_faces = []
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    # ==== FACE DETECTION (Full Frame) ====
-    faces = face_app.get(frame)
+    if frame_count % skip_frames != 0:
+        frame_count += 1
+        continue
 
-    current_faces = []  # to associate with tracks
+    current_faces = []
 
-    for face in faces:
-        embedding = face.embedding
-        bbox = face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
+    # ==== PERSON DETECTION + TRACKING ====
+    results = yolo.track(
+        frame, persist=True, classes=[0], verbose=False, imgsz=320
+    )[0]
 
-        # ==== FACE RE-ID MATCHING ====
+    person_boxes = []
+    if results.boxes is not None:
+        for box in results.boxes:
+            person_box = box.xyxy[0].cpu().numpy().astype(int)
+            px1, py1, px2, py2 = person_box
+            track_id = int(box.id.item()) if box.id is not None else None
+            if track_id is not None:
+                person_boxes.append((track_id, px1, py1, px2, py2))
+
+    # ==== FACE DETECTION every N frames ====
+    if frame_count % face_detect_interval == 0:
+        cached_faces = []
+        for track_id, px1, py1, px2, py2 in person_boxes:
+            head_crop = frame[py1:int(py1 + (py2 - py1) * 0.3), px1:px2]
+            if head_crop.size == 0:
+                continue
+            faces = face_app.get(head_crop)
+            for face in faces:
+                embedding = face.embedding
+                bbox = face.bbox.astype(int)
+                # Adjust bbox to global coords
+                fx1, fy1, fx2, fy2 = px1 + bbox[0], py1 + bbox[1], px1 + bbox[2], py1 + bbox[3]
+                cached_faces.append((embedding, (fx1, fy1, fx2, fy2), track_id))
+
+    # ==== FACE RE-ID MATCHING ====
+    for embedding, (fx1, fy1, fx2, fy2), track_id in cached_faces:
         matched_id = None
-        for face_id, embeddings in face_db.items():
-            for stored_emb in embeddings:
-                dist = cosine(embedding, stored_emb)
-                if dist < similarity_threshold:
-                    matched_id = face_id
-                    break
-            if matched_id is not None:
-                break
+        if face_db:
+            all_embeddings = np.array([emb for emb_list in face_db.values() for emb in emb_list])
+            all_ids = np.array([fid for fid, emb_list in face_db.items() for _ in emb_list])
+            dists = cdist([embedding], all_embeddings, metric='cosine')[0]
+            best_idx = np.argmin(dists)
+            if dists[best_idx] < similarity_threshold:
+                matched_id = all_ids[best_idx]
 
         if matched_id is None:
             matched_id = next_face_id
             face_db[matched_id] = []
             next_face_id += 1
 
-        # Add embedding to memory
         if len(face_db[matched_id]) >= embedding_buffer_size:
             face_db[matched_id].pop(0)
         face_db[matched_id].append(embedding)
 
-        # Draw face box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"FaceID: {matched_id}", (x1, y1 - 10),
+        track_to_face[track_id] = matched_id
+        current_faces.append((matched_id, (fx1, fy1, fx2, fy2)))
+
+    # ==== DRAW RESULTS ====
+    for track_id, px1, py1, px2, py2 in person_boxes:
+        matched_face_id = track_to_face.get(track_id, None)
+        label = f"ID: {matched_face_id}" if matched_face_id is not None else "ID: ?"
+        cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (px1, py1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    for fid, (fx1, fy1, fx2, fy2) in [(fid, bbox) for fid, bbox in current_faces]:
+        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
+        cv2.putText(frame, f"FaceID: {fid}", (fx1, fy1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-        # Save to list for matching to person boxes
-        current_faces.append((matched_id, (x1, y1, x2, y2)))
-
-    # ==== PERSON DETECTION + TRACKING ====
-    results = yolo.track(frame, persist=True, classes=[0], verbose=False)[0]
-
-    if results.boxes is not None:
-        for box in results.boxes:
-            person_box = box.xyxy[0].cpu().numpy().astype(int)
-            px1, py1, px2, py2 = person_box
-
-            # Get YOLO track_id
-            track_id = int(box.id.item()) if box.id is not None else None
-            if track_id is None:
-                continue
-
-            # === Match this tracked person to nearest face ===
-            matched_face_id = track_to_face.get(track_id, None)
-            for fid, (fx1, fy1, fx2, fy2) in current_faces:
-                face_center = np.array([(fx1 + fx2) / 2, (fy1 + fy2) / 2])
-                if px1 <= face_center[0] <= px2 and py1 <= face_center[1] <= py2:
-                    matched_face_id = fid
-                    track_to_face[track_id] = fid
-                    break
-
-            # Draw person box with face ID
-            label = f"ID: {matched_face_id}" if matched_face_id is not None else "ID: ?"
-            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (px1, py1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     # ==== Write frame ====
     out.write(frame)
@@ -109,7 +120,8 @@ while cap.isOpened():
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Cleanup
+    frame_count += 1
+
 cap.release()
 out.release()
 cv2.destroyAllWindows()
