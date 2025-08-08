@@ -9,14 +9,15 @@ input_path = r"test.mp4"
 output_path = "output.mp4"
 similarity_threshold = 0.5
 embedding_buffer_size = 10
-face_detect_interval = 5  # Run InsightFace every N frames
-process_fps = 20           # Target FPS for processing
+face_detect_interval = 2
+process_fps = 20
+reuse_face_id_window = 30  # Number of frames to keep track_id ↔ face_id mapping
 # =======================
 
 # === Initialize Models ===
-yolo = YOLO("yolo11n.pt")  # smallest YOLO model
+yolo = YOLO("yolo11n.pt")  # Smallest YOLO model
 face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(320, 320))  # smaller input size for speed
+face_app.prepare(ctx_id=0, det_size=(320, 320))
 
 # === Load video ===
 cap = cv2.VideoCapture(input_path)
@@ -33,7 +34,8 @@ face_db = {}  # {face_id: [embeddings]}
 next_face_id = 0
 
 # === Tracker ↔ Face ID mapping ===
-track_to_face = {}  # {track_id: face_id}
+track_to_face = {}       # {track_id: face_id}
+track_last_seen = {}     # {track_id: last_seen_frame}
 
 frame_count = 0
 cached_faces = []
@@ -50,9 +52,7 @@ while cap.isOpened():
     current_faces = []
 
     # ==== PERSON DETECTION + TRACKING ====
-    results = yolo.track(
-        frame, persist=True, classes=[0], verbose=False, imgsz=320
-    )[0]
+    results = yolo.track(frame, persist=True, classes=[0], verbose=False, imgsz=320)[0]
 
     person_boxes = []
     if results.boxes is not None:
@@ -67,27 +67,31 @@ while cap.isOpened():
     if frame_count % face_detect_interval == 0:
         cached_faces = []
         for track_id, px1, py1, px2, py2 in person_boxes:
-            head_crop = frame[py1:int(py1 + (py2 - py1) * 0.3), px1:px2]
+            face_h = int((py2 - py1) * 0.5)
+            head_crop = frame[py1:py1 + face_h, px1:px2]
             if head_crop.size == 0:
                 continue
             faces = face_app.get(head_crop)
             for face in faces:
                 embedding = face.embedding
                 bbox = face.bbox.astype(int)
-                # Adjust bbox to global coords
                 fx1, fy1, fx2, fy2 = px1 + bbox[0], py1 + bbox[1], px1 + bbox[2], py1 + bbox[3]
                 cached_faces.append((embedding, (fx1, fy1, fx2, fy2), track_id))
 
     # ==== FACE RE-ID MATCHING ====
     for embedding, (fx1, fy1, fx2, fy2), track_id in cached_faces:
         matched_id = None
-        if face_db:
-            all_embeddings = np.array([emb for emb_list in face_db.values() for emb in emb_list])
-            all_ids = np.array([fid for fid, emb_list in face_db.items() for _ in emb_list])
-            dists = cdist([embedding], all_embeddings, metric='cosine')[0]
-            best_idx = np.argmin(dists)
-            if dists[best_idx] < similarity_threshold:
-                matched_id = all_ids[best_idx]
+
+        if track_id in track_to_face and frame_count - track_last_seen.get(track_id, 0) <= reuse_face_id_window:
+            matched_id = track_to_face[track_id]
+        else:
+            if face_db:
+                all_embeddings = np.array([emb for emb_list in face_db.values() for emb in emb_list])
+                all_ids = np.array([fid for fid, emb_list in face_db.items() for _ in emb_list])
+                dists = cdist([embedding], all_embeddings, metric='cosine')[0]
+                best_idx = np.argmin(dists)
+                if dists[best_idx] < similarity_threshold:
+                    matched_id = all_ids[best_idx]
 
         if matched_id is None:
             matched_id = next_face_id
@@ -99,12 +103,20 @@ while cap.isOpened():
         face_db[matched_id].append(embedding)
 
         track_to_face[track_id] = matched_id
+        track_last_seen[track_id] = frame_count
         current_faces.append((matched_id, (fx1, fy1, fx2, fy2)))
+
+    # ==== CLEANUP OLD TRACKS ====
+    for tid in list(track_last_seen.keys()):
+        if frame_count - track_last_seen[tid] > reuse_face_id_window:
+            track_to_face.pop(tid, None)
+            track_last_seen.pop(tid, None)
 
     # ==== DRAW RESULTS ====
     for track_id, px1, py1, px2, py2 in person_boxes:
         matched_face_id = track_to_face.get(track_id, None)
-        label = f"ID: {matched_face_id}" if matched_face_id is not None else "ID: ?"
+        # label = f"ID: {matched_face_id}" if matched_face_id is not None else "ID: ?"
+        label = ""
         cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
         cv2.putText(frame, label, (px1, py1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
