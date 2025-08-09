@@ -11,7 +11,7 @@ output_path = "output.mp4"
 log_csv_path = "face_log.csv"
 similarity_threshold = 0.5
 embedding_buffer_size = 10
-face_detect_interval = 1
+face_detect_interval = 2
 process_fps = 20
 reuse_face_id_window = 30
 # =======================
@@ -67,11 +67,10 @@ while cap.isOpened():
                 person_boxes.append((track_id, px1, py1, px2, py2))
 
     # ==== FACE DETECTION every N frames ====
-    if frame_count % face_detect_interval == 0: 
+    if frame_count % face_detect_interval == 0:
         cached_faces = []
         for track_id, px1, py1, px2, py2 in person_boxes:
-            # face_h = int((py2 - py1) * 0.7)
-            face_h = int((py2 - py1))
+            face_h = int((py2 - py1)*0.8)
             head_crop = frame[py1:py1 + face_h, px1:px2]
             if head_crop.size == 0:
                 continue
@@ -137,6 +136,13 @@ while cap.isOpened():
     for fid, (fx1, fy1, fx2, fy2) in [(fid, bbox) for fid, bbox in current_faces]:
         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
         cv2.putText(frame, f"FaceID: {fid}", (fx1, fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+        # ==== DISPLAY TOTAL ELAPSED TIME ====
+    elapsed_seconds = frame_count / fps
+    elapsed_time_str = f"Elapsed: {elapsed_seconds:.2f}s"
+    cv2.putText(frame, elapsed_time_str, (10, height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
 
     out.write(frame)
     cv2.imshow("YOLO + InsightFace", frame)
