@@ -4,16 +4,17 @@ from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 from scipy.spatial.distance import cdist
 import csv
+import time
 
 # ======= CONFIG =======
 input_path = r"test.mp4"
 output_path = "output.mp4"
 log_csv_path = "face_log.csv"
-similarity_threshold = 0.5
-embedding_buffer_size = 10
-face_detect_interval = 2
-process_fps = 20
-reuse_face_id_window = 30
+similarity_threshold = 0.5      # Cosine distance threshold for same person
+embedding_buffer_size = 10      # How many embeddings per face to store
+face_detect_interval = 2        # Detect face every N frames
+process_fps = 20                 # Processing FPS
+min_track_seconds = 1.0          # Minimum time a person must be tracked before committing ID
 # =======================
 
 # === Initialize Models ===
@@ -22,7 +23,8 @@ face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
 face_app.prepare(ctx_id=0, det_size=(320, 320))
 
 # === Load video ===
-cap = cv2.VideoCapture(input_path)
+# cap = cv2.VideoCapture(input_path)
+cap = cv2.VideoCapture(0)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -32,17 +34,31 @@ fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(output_path, fourcc, process_fps, (width, height))
 
 # === Face ID memory ===
-face_db = {}
+face_db = {}       # {face_id: [embeddings]}
 next_face_id = 0
-
-track_to_face = {}
-track_last_seen = {}
+track_to_face = {} # {track_id: face_id}
 
 frame_count = 0
 cached_faces = []
 
+# Track pending IDs before committing
+pending_tracks = {}  # {track_id: {'start_time': frame_idx}}
+
 # === Face presence log ===
 face_log = {}  # {face_id: [(start_frame, end_frame), ...]}
+
+def merge_segments(segments, max_gap_frames):
+    if not segments:
+        return []
+    segments.sort()
+    merged = [segments[0]]
+    for start, end in segments[1:]:
+        last_start, last_end = merged[-1]
+        if start - last_end <= max_gap_frames:
+            merged[-1][1] = max(last_end, end)
+        else:
+            merged.append([start, end])
+    return merged
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -65,12 +81,14 @@ while cap.isOpened():
             track_id = int(box.id.item()) if box.id is not None else None
             if track_id is not None:
                 person_boxes.append((track_id, px1, py1, px2, py2))
+                if track_id not in pending_tracks and track_id not in track_to_face:
+                    pending_tracks[track_id] = {'start_frame': frame_count}
 
     # ==== FACE DETECTION every N frames ====
     if frame_count % face_detect_interval == 0:
         cached_faces = []
         for track_id, px1, py1, px2, py2 in person_boxes:
-            face_h = int((py2 - py1)*0.8)
+            face_h = int((py2 - py1) * 0.8)
             head_crop = frame[py1:py1 + face_h, px1:px2]
             if head_crop.size == 0:
                 continue
@@ -84,10 +102,14 @@ while cap.isOpened():
     # ==== FACE RE-ID MATCHING ====
     for embedding, (fx1, fy1, fx2, fy2), track_id in cached_faces:
         matched_id = None
+        # Commit only if tracked long enough
+        if track_id not in track_to_face:
+            if track_id in pending_tracks:
+                tracked_duration = (frame_count - pending_tracks[track_id]['start_frame']) / fps
+                if tracked_duration < min_track_seconds:
+                    continue  # Skip until tracked for >= 1 sec
 
-        if track_id in track_to_face and frame_count - track_last_seen.get(track_id, 0) <= reuse_face_id_window:
-            matched_id = track_to_face[track_id]
-        else:
+            # Step 2: Match with existing faces in global DB
             if face_db:
                 all_embeddings = np.array([emb for emb_list in face_db.values() for emb in emb_list])
                 all_ids = np.array([fid for fid, emb_list in face_db.items() for _ in emb_list])
@@ -96,53 +118,48 @@ while cap.isOpened():
                 if dists[best_idx] < similarity_threshold:
                     matched_id = all_ids[best_idx]
 
-        if matched_id is None:
-            matched_id = next_face_id
-            face_db[matched_id] = []
-            next_face_id += 1
+            # Step 3: If no match, create new ID
+            if matched_id is None:
+                matched_id = next_face_id
+                face_db[matched_id] = []
+                next_face_id += 1
 
-        if len(face_db[matched_id]) >= embedding_buffer_size:
-            face_db[matched_id].pop(0)
-        face_db[matched_id].append(embedding)
+            track_to_face[track_id] = matched_id
+            if track_id in pending_tracks:
+                del pending_tracks[track_id]  # cleanup
 
-        track_to_face[track_id] = matched_id
-        track_last_seen[track_id] = frame_count
-        current_faces.append((matched_id, (fx1, fy1, fx2, fy2)))
-
-        # === LOG APPEARANCE ===
-        if matched_id not in face_log:
-            face_log[matched_id] = []
-
-        if not face_log[matched_id] or frame_count - face_log[matched_id][-1][1] > face_detect_interval * 2:
-            # New segment
-            face_log[matched_id].append([frame_count, frame_count])
         else:
-            # Update end frame of ongoing segment
-            face_log[matched_id][-1][1] = frame_count
+            matched_id = track_to_face[track_id]
 
-    # ==== CLEANUP OLD TRACKS ====
-    for tid in list(track_last_seen.keys()):
-        if frame_count - track_last_seen[tid] > reuse_face_id_window:
-            track_to_face.pop(tid, None)
-            track_last_seen.pop(tid, None)
+        # Step 4: Store embedding
+        if matched_id is not None:
+            if len(face_db[matched_id]) >= embedding_buffer_size:
+                face_db[matched_id].pop(0)
+            face_db[matched_id].append(embedding)
+            current_faces.append((matched_id, (fx1, fy1, fx2, fy2)))
+
+            # === LOG APPEARANCE ===
+            if matched_id not in face_log:
+                face_log[matched_id] = []
+            if not face_log[matched_id] or frame_count - face_log[matched_id][-1][1] > face_detect_interval * 2:
+                face_log[matched_id].append([frame_count, frame_count])
+            else:
+                face_log[matched_id][-1][1] = frame_count
 
     # ==== DRAW RESULTS ====
     for track_id, px1, py1, px2, py2 in person_boxes:
-        matched_face_id = track_to_face.get(track_id, None)
-        label = ""
         cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    for fid, (fx1, fy1, fx2, fy2) in [(fid, bbox) for fid, bbox in current_faces]:
+    for fid, (fx1, fy1, fx2, fy2) in current_faces:
         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
-        cv2.putText(frame, f"FaceID: {fid}", (fx1, fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        cv2.putText(frame, f"FaceID: {fid}", (fx1, fy1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        # ==== DISPLAY TOTAL ELAPSED TIME ====
+    # ==== DISPLAY TOTAL ELAPSED TIME ====
     elapsed_seconds = frame_count / fps
     elapsed_time_str = f"Elapsed: {elapsed_seconds:.2f}s"
     cv2.putText(frame, elapsed_time_str, (10, height - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
 
     out.write(frame)
     cv2.imshow("YOLO + InsightFace", frame)
@@ -155,21 +172,6 @@ cap.release()
 out.release()
 cv2.destroyAllWindows()
 
-def merge_segments(segments, max_gap_frames):
-    if not segments:
-        return []
-
-    segments.sort()
-    merged = [segments[0]]
-
-    for start, end in segments[1:]:
-        last_start, last_end = merged[-1]
-        if start - last_end <= max_gap_frames:
-            merged[-1][1] = max(last_end, end)  # Extend previous
-        else:
-            merged.append([start, end])
-    return merged
-
 # ==== WRITE LOG TO CSV ====
 with open(log_csv_path, mode='w', newline='') as f:
     writer = csv.writer(f)
@@ -180,11 +182,8 @@ with open(log_csv_path, mode='w', newline='') as f:
 
     for face_id, spans in face_log.items():
         merged_spans = merge_segments(spans, max_gap_frames)
-
-        # Calculate total duration for this face
         total_duration = sum((end_f - start_f) / fps for start_f, end_f in merged_spans)
 
-        # Only log if total duration > 1 second
         if total_duration > 1:
             for start_f, end_f in merged_spans:
                 start_time = round(start_f / fps, 2)
