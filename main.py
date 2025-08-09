@@ -11,13 +11,13 @@ output_path = "output.mp4"
 log_csv_path = "face_log.csv"
 similarity_threshold = 0.5
 embedding_buffer_size = 10
-face_detect_interval = 2
+face_detect_interval = 1
 process_fps = 20
 reuse_face_id_window = 30
 # =======================
 
 # === Initialize Models ===
-yolo = YOLO("yolo11n.pt")
+yolo = YOLO("yolo11s.pt")
 face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
 face_app.prepare(ctx_id=0, det_size=(320, 320))
 
@@ -67,7 +67,7 @@ while cap.isOpened():
                 person_boxes.append((track_id, px1, py1, px2, py2))
 
     # ==== FACE DETECTION every N frames ====
-    if frame_count % face_detect_interval == 0:
+    if frame_count % face_detect_interval == 0: 
         cached_faces = []
         for track_id, px1, py1, px2, py2 in person_boxes:
             # face_h = int((py2 - py1) * 0.7)
