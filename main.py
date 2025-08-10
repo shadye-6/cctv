@@ -6,34 +6,27 @@ import cv2
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 
-# ---------------- CONFIG ----------------
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+
 INPUT_PATH = "test.mp4"
 OUTPUT_PATH = "output.mp4"
+FACE_DB_JSON = "face_db.json"
 LOG_CSV = "face_log.csv"
-PERSIST_JSON = "face_db.json"
 
-SIMILARITY_THRESHOLD = 0.5
-EMBEDDING_BUFFER_SIZE = 10
+SIMILARITY_THRESHOLD = 0.4  # Cosine similarity cutoff (higher is more similar)
+EMBEDDING_BUFFER_SIZE = 20
 FACE_DETECT_INTERVAL = 2
 PROCESS_FPS = 20
 MIN_TRACK_SECONDS = 1.0
-
-# ----------------------------------------
 
 # Initialize models
 yolo = YOLO("yolo11s.pt")
 face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
 face_app.prepare(ctx_id=-1, det_size=(320, 320))
-
-# Load or init face DB
-if os.path.exists(PERSIST_JSON):
-    with open(PERSIST_JSON, 'r') as f:
-        raw_db = json.load(f)
-    face_db = {int(k): [np.array(e, dtype=np.float32) for e in v] for k, v in raw_db.items()}
-    next_face_id = max(face_db.keys()) + 1 if face_db else 0
-else:
-    face_db = {}
-    next_face_id = 0
 
 def normalize_vec(v):
     norm = np.linalg.norm(v)
@@ -41,44 +34,42 @@ def normalize_vec(v):
         return None
     return v / norm
 
-def find_matching_face(norm_emb):
-    best_id = None
-    best_dist = 1.0  # cosine distance ranges from 0 (same) to 2 (opposite)
-    for fid, embeddings in face_db.items():
-        for e in embeddings:
-            e_norm = normalize_vec(e)
-            if e_norm is None:
-                continue
-            dist = 1 - np.dot(norm_emb, e_norm)  # cosine distance = 1 - cosine similarity
-            if dist < best_dist:
-                best_dist = dist
-                best_id = fid
-    if best_dist < SIMILARITY_THRESHOLD:
-        return best_id
-    return None
+# --- Load or init face DB ---
+face_db = {}
+next_face_id = 0
 
-def add_embedding(fid, emb):
-    if fid not in face_db:
-        face_db[fid] = []
-    face_db[fid].append(emb)
-    # Keep buffer size fixed
-    if len(face_db[fid]) > EMBEDDING_BUFFER_SIZE:
-        face_db[fid].pop(0)
+if os.path.exists(FACE_DB_JSON):
+    with open(FACE_DB_JSON, 'r') as f:
+        raw = json.load(f)
+    face_db = {int(k): [np.array(e, dtype=np.float32) for e in v] for k, v in raw.items()}
+    next_face_id = max(face_db.keys(), default=-1) + 1
 
-def merge_segments(segments, max_gap_frames):
-    if not segments:
-        return []
-    segments.sort()
-    merged = [segments[0][:]]
-    for start, end in segments[1:]:
-        last_start, last_end = merged[-1]
-        if start - last_end <= max_gap_frames:
-            merged[-1][1] = max(last_end, end)
-        else:
-            merged.append([start, end])
-    return merged
+# --- Build FAISS index from face_db ---
+embedding_dim = None
+pos_to_fid = []
+faiss_index = None
 
-# Video capture and writer setup
+def build_faiss():
+    global faiss_index, pos_to_fid, embedding_dim
+    pos_to_fid.clear()
+    all_vecs = []
+    for fid in sorted(face_db.keys()):
+        for emb in face_db[fid]:
+            norm_emb = normalize_vec(emb)
+            if norm_emb is not None:
+                all_vecs.append(norm_emb)
+                pos_to_fid.append(fid)
+    if not all_vecs:
+        faiss_index = None
+        embedding_dim = None
+        return
+    embedding_dim = all_vecs[0].shape[0]
+    faiss_index = faiss.IndexFlatIP(embedding_dim)
+    faiss_index.add(np.vstack(all_vecs).astype('float32'))
+
+build_faiss()
+
+# Video capture and output
 cap = cv2.VideoCapture(INPUT_PATH)
 if not cap.isOpened():
     raise RuntimeError(f"Cannot open video {INPUT_PATH}")
@@ -91,13 +82,10 @@ skip_frames = max(1, int(fps / PROCESS_FPS))
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(OUTPUT_PATH, fourcc, PROCESS_FPS, (width, height))
 
-# Tracking structures
+frame_count = 0
 track_to_face = {}
 pending_tracks = {}
 face_log = {}
-
-frame_count = 0
-cached_faces = []
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -108,7 +96,7 @@ while cap.isOpened():
         frame_count += 1
         continue
 
-    # Person detection + tracking
+    # YOLO person detection + tracking
     results = yolo.track(frame, persist=True, classes=[0], verbose=False, imgsz=320)[0]
     person_boxes = []
     if results.boxes is not None:
@@ -127,9 +115,9 @@ while cap.isOpened():
                 if track_id not in pending_tracks and track_id not in track_to_face:
                     pending_tracks[track_id] = {'start_frame': frame_count}
 
-    # Face detection every N frames
+    # Face detection every FACE_DETECT_INTERVAL frames
+    cached_faces = []
     if frame_count % FACE_DETECT_INTERVAL == 0:
-        cached_faces.clear()
         for track_id, px1, py1, px2, py2 in person_boxes:
             face_h = int((py2 - py1) * 0.8)
             cy1 = py1
@@ -144,7 +132,7 @@ while cap.isOpened():
             try:
                 faces = face_app.get(face_crop)
             except Exception as e:
-                print("[WARN] insightface error:", e)
+                print("[WARN] InsightFace error:", e)
                 continue
             if not faces:
                 continue
@@ -172,7 +160,6 @@ while cap.isOpened():
 
     current_faces = []
 
-    # Match embeddings & assign face IDs
     for embedding, bbox, track_id in cached_faces:
         norm_emb = normalize_vec(embedding)
         if norm_emb is None:
@@ -181,29 +168,60 @@ while cap.isOpened():
         matched_id = None
 
         if track_id not in track_to_face:
-            # Wait for minimum track duration before assigning face_id
+            # Wait minimum tracked time before matching
             if track_id in pending_tracks:
                 duration = (frame_count - pending_tracks[track_id]['start_frame']) / fps
                 if duration < MIN_TRACK_SECONDS:
                     continue
 
-            matched_id = find_matching_face(norm_emb)
+            # FAISS search
+            if FAISS_AVAILABLE and faiss_index is not None and faiss_index.ntotal > 0:
+                D, I = faiss_index.search(norm_emb[np.newaxis, :].astype('float32'), 1)
+                sim = float(D[0][0])
+                pos = int(I[0][0])
+                if 0 <= pos < len(pos_to_fid):
+                    fid_candidate = pos_to_fid[pos]
+                    if sim >= SIMILARITY_THRESHOLD:
+                        matched_id = fid_candidate
 
+            # Brute force fallback
+            if matched_id is None:
+                best_sim = -1
+                best_fid = None
+                for fid, embs in face_db.items():
+                    for e in embs:
+                        sim = np.dot(norm_emb, e)
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_fid = fid
+                if best_sim >= SIMILARITY_THRESHOLD:
+                    matched_id = best_fid
+
+            # New face
             if matched_id is None:
                 matched_id = next_face_id
                 next_face_id += 1
+                face_db[matched_id] = []
 
-            add_embedding(matched_id, embedding)
             track_to_face[track_id] = matched_id
             if track_id in pending_tracks:
                 del pending_tracks[track_id]
+
         else:
             matched_id = track_to_face[track_id]
-            add_embedding(matched_id, embedding)
+
+        # Add embedding & maintain buffer
+        face_db.setdefault(matched_id, [])
+        face_db[matched_id].append(norm_emb)
+        if len(face_db[matched_id]) > EMBEDDING_BUFFER_SIZE:
+            face_db[matched_id].pop(0)
+
+        # Rebuild FAISS index to include new embeddings (periodically or here for demo)
+        build_faiss()
 
         current_faces.append((matched_id, bbox))
 
-        # Log appearance segments for CSV
+        # Log appearances
         if matched_id not in face_log:
             face_log[matched_id] = []
         if not face_log[matched_id] or frame_count - face_log[matched_id][-1][1] > FACE_DETECT_INTERVAL * 2:
@@ -211,10 +229,9 @@ while cap.isOpened():
         else:
             face_log[matched_id][-1][1] = frame_count
 
-    # Draw boxes on frame
+    # Draw boxes and IDs
     for track_id, px1, py1, px2, py2 in person_boxes:
         cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
-
     for fid, bbox in current_faces:
         fx1, fy1, fx2, fy2 = bbox
         if fx1 is not None:
@@ -222,45 +239,55 @@ while cap.isOpened():
             cv2.putText(frame, f"FaceID: {fid}", (fx1, fy1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-    elapsed_seconds = frame_count / fps
-    cv2.putText(frame, f"Elapsed: {elapsed_seconds:.2f}s", (10, height - 20),
+    cv2.putText(frame, f"Time: {frame_count / fps:.2f}s", (10, height - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
     out.write(frame)
-    cv2.imshow("YOLO + InsightFace", frame)
+    cv2.imshow("Face Tracking", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
     frame_count += 1
 
-# Cleanup
 cap.release()
 out.release()
 cv2.destroyAllWindows()
 
-# Save persistent face_db
-with open(PERSIST_JSON, 'w') as f:
+# Save persistent face DB
+with open(FACE_DB_JSON, 'w') as f:
     serial = {str(fid): [e.tolist() for e in embs] for fid, embs in face_db.items()}
     json.dump(serial, f, indent=2)
 
-# Append to CSV log, create header if file doesn't exist
-max_gap_seconds = 5
-max_gap_frames = int(max_gap_seconds * fps)
+# Append CSV logs (with run timestamp)
+def merge_segments(segments, max_gap_frames):
+    if not segments:
+        return []
+    segments.sort()
+    merged = [segments[0][:]]
+    for start, end in segments[1:]:
+        last_start, last_end = merged[-1]
+        if start - last_end <= max_gap_frames:
+            merged[-1][1] = max(last_end, end)
+        else:
+            merged.append([start, end])
+    return merged
+
+from datetime import datetime
+run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+max_gap_frames = int(5 * fps)
 
 file_exists = os.path.exists(LOG_CSV)
 with open(LOG_CSV, 'a', newline='') as f:
     writer = csv.writer(f)
     if not file_exists:
-        writer.writerow(["FaceID", "StartTime", "EndTime", "DurationSeconds"])
-
+        writer.writerow(["FaceID", "StartTime", "EndTime", "DurationSeconds", "RunTimestamp"])
     for face_id, segments in face_log.items():
-        merged_segments = merge_segments(segments, max_gap_frames)
-        total_duration = sum((end - start) / fps for start, end in merged_segments)
-        if total_duration > 1.0:
-            for start, end in merged_segments:
-                writer.writerow([
-                    face_id,
-                    f"{start / fps:.2f}",
-                    f"{end / fps:.2f}",
-                    f"{(end - start) / fps:.2f}"
-                ])
+        merged = merge_segments(segments, max_gap_frames)
+        for start, end in merged:
+            writer.writerow([
+                face_id,
+                f"{start / fps:.2f}",
+                f"{end / fps:.2f}",
+                f"{(end - start) / fps:.2f}",
+                run_timestamp
+            ])
