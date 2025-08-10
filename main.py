@@ -17,13 +17,12 @@ OUTPUT_PATH = "output.mp4"
 FACE_DB_JSON = "face_db.json"
 LOG_CSV = "face_log.csv"
 
-SIMILARITY_THRESHOLD = 0.4  # Cosine similarity cutoff (higher is more similar)
+SIMILARITY_THRESHOLD = 0.4
 EMBEDDING_BUFFER_SIZE = 20
 FACE_DETECT_INTERVAL = 2
 PROCESS_FPS = 20
 MIN_TRACK_SECONDS = 1.0
 
-# Initialize models
 yolo = YOLO("yolo11s.pt")
 face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
 face_app.prepare(ctx_id=-1, det_size=(320, 320))
